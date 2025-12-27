@@ -18,10 +18,10 @@ MATCHED_FILE = OUTPUT_DIR / "matched_candidates.csv"
 VERIFIED_FILE = OUTPUT_DIR / "verified_brands.csv"
 
 # Настройки
-BATCH_SIZE = 10
-MAX_RPS = 8
-MAX_RETRIES = 3
-RETRY_DELAY = 2
+MAX_CONCURRENT = 8  # Максимум параллельных запросов
+MAX_RETRIES = 2
+RETRY_DELAY = 3
+TIMEOUT = 180  # секунд
 
 # Промпт
 SYSTEM_PROMPT = """Ты эксперт аналитик. Твоя задача - определить, какие бренды/компании из предоставленного списка ДЕЙСТВИТЕЛЬНО упоминаются в диалоге КАК НАЗВАНИЯ БРЕНДОВ.
@@ -61,18 +61,6 @@ def create_output_schema(brand_list: list) -> dict:
     }
 
 
-class RateLimiter:
-    def __init__(self, max_per_second: float):
-        self.min_interval = 1.0 / max_per_second
-        self.last_call = 0
-
-    async def acquire(self):
-        now = time.time()
-        if now - self.last_call < self.min_interval:
-            await asyncio.sleep(self.min_interval - (now - self.last_call))
-        self.last_call = time.time()
-
-
 def create_open_schema() -> dict:
     """Создает схему без enum - для поиска любых брендов"""
     return {
@@ -99,35 +87,37 @@ def create_open_schema() -> dict:
 
 async def verify_brands(
     session: aiohttp.ClientSession,
-    dialog_id: int,
-    dialog_text: str,
-    candidates: list,
-    rate_limiter: RateLimiter,
-    retry_count: int = 0
+    semaphore: asyncio.Semaphore,
+    dialog: dict,
+    progress: dict
 ) -> dict:
-    """Верифицирует бренды через LLM"""
-    await rate_limiter.acquire()
+    """Верифицирует бренды через LLM с семафором для ограничения параллельности"""
+    dialog_id = dialog["dialog_id"]
+    dialog_text = dialog["text"]
+    candidates = dialog["candidates"]
 
-    headers = {
-        "Authorization": f"Bearer {TOGETHER_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    async with semaphore:
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                headers = {
+                    "Authorization": f"Bearer {TOGETHER_API_KEY}",
+                    "Content-Type": "application/json"
+                }
 
-    # Формируем запрос в зависимости от наличия кандидатов
-    if candidates:
-        # Есть кандидаты - проверяем их
-        brands_formatted = []
-        brand_names = []
-        for item in candidates:
-            if '|' in item:
-                brand, synonym = item.split('|', 1)
-                brands_formatted.append(f"- {brand} (упоминается как '{synonym}')")
-                brand_names.append(brand)
-            else:
-                brands_formatted.append(f"- {item}")
-                brand_names.append(item)
+                # Формируем запрос в зависимости от наличия кандидатов
+                if candidates:
+                    brands_formatted = []
+                    brand_names = []
+                    for item in candidates:
+                        if '|' in item:
+                            brand, synonym = item.split('|', 1)
+                            brands_formatted.append(f"- {brand} (упоминается как '{synonym}')")
+                            brand_names.append(brand)
+                        else:
+                            brands_formatted.append(f"- {item}")
+                            brand_names.append(item)
 
-        user_message = f"""ДИАЛОГ:
+                    user_message = f"""ДИАЛОГ:
 {dialog_text}
 
 СПИСОК БРЕНДОВ ДЛЯ ПРОВЕРКИ:
@@ -135,60 +125,76 @@ async def verify_brands(
 
 Укажи, какие бренды из списка ДЕЙСТВИТЕЛЬНО упоминаются в диалоге."""
 
-        schema = create_output_schema(brand_names)
-    else:
-        # Нет кандидатов - ищем любые бренды
-        user_message = f"""ДИАЛОГ:
+                    schema = create_output_schema(brand_names)
+                else:
+                    user_message = f"""ДИАЛОГ:
 {dialog_text}
 
 Найди ВСЕ бренды товаров, производителей, маркетплейсов, которые упоминаются в диалоге."""
 
-        schema = create_open_schema()
+                    schema = create_open_schema()
 
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message}
-        ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": "brand_filter", "schema": schema, "strict": True}
-        },
-        "temperature": 0.1
-    }
+                payload = {
+                    "model": MODEL,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_message}
+                    ],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {"name": "brand_filter", "schema": schema, "strict": True}
+                    },
+                    "temperature": 0.1
+                }
 
-    try:
-        async with session.post(API_URL, headers=headers, json=payload, timeout=60) as response:
-            if response.status in [429, 503] and retry_count < MAX_RETRIES:
-                await asyncio.sleep(RETRY_DELAY * (retry_count + 1))
-                return await verify_brands(session, dialog_id, dialog_text, candidates, rate_limiter, retry_count + 1)
+                timeout = aiohttp.ClientTimeout(total=TIMEOUT)
+                async with session.post(API_URL, headers=headers, json=payload, timeout=timeout) as response:
+                    if response.status in [429, 503]:
+                        if attempt < MAX_RETRIES:
+                            await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                            continue
+                        raise Exception(f"API error: {response.status}")
 
-            response.raise_for_status()
-            result = await response.json()
+                    response.raise_for_status()
+                    result = await response.json()
 
-            content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
-            parsed = json.loads(content)
+                    content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+                    parsed = json.loads(content)
 
-            # Фильтруем confidence=0
-            brands = [b for b in parsed.get("brands", []) if b.get("confidence", 0) > 0]
+                    # Фильтруем confidence=0
+                    brands = [b for b in parsed.get("brands", []) if b.get("confidence", 0) > 0]
 
-            return {
-                "dialog_id": dialog_id,
-                "verified_brands": brands,
-                "status": "success"
-            }
+                    # Обновляем прогресс
+                    progress["success"] += 1
+                    progress["done"] += 1
+                    if progress["done"] % 10 == 0:
+                        print(f"  Прогресс: {progress['done']}/{progress['total']} (успешно: {progress['success']})")
 
-    except Exception as e:
-        if retry_count < MAX_RETRIES:
-            await asyncio.sleep(RETRY_DELAY * (retry_count + 1))
-            return await verify_brands(session, dialog_id, dialog_text, candidates, rate_limiter, retry_count + 1)
+                    return {
+                        "dialog_id": dialog_id,
+                        "verified_brands": brands,
+                        "ground_truth": dialog["ground_truth"],
+                        "source_text": dialog_text,
+                        "status": "success"
+                    }
 
-        return {
-            "dialog_id": dialog_id,
-            "error": str(e),
-            "status": "error"
-        }
+            except Exception as e:
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                    continue
+
+                progress["errors"] += 1
+                progress["done"] += 1
+                if progress["done"] % 10 == 0:
+                    print(f"  Прогресс: {progress['done']}/{progress['total']} (ошибок: {progress['errors']})")
+
+                return {
+                    "dialog_id": dialog_id,
+                    "error": str(e),
+                    "ground_truth": dialog["ground_truth"],
+                    "source_text": dialog_text,
+                    "status": "error"
+                }
 
 
 async def main():
@@ -223,33 +229,24 @@ async def main():
 
     dialogs_with_candidates = sum(1 for d in dialogs if d["candidates"])
     print(f"Диалогов с кандидатами: {dialogs_with_candidates}/{len(dialogs)}")
-    print(f"Примерное время: {len(dialogs) / MAX_RPS / 60:.1f} мин")
+    print(f"Параллельных запросов: {MAX_CONCURRENT}")
+    print(f"Timeout: {TIMEOUT}s, Retries: {MAX_RETRIES}")
 
-    # Обработка
-    rate_limiter = RateLimiter(MAX_RPS)
-    results = []
+    # Прогресс
+    progress = {"done": 0, "total": len(dialogs), "success": 0, "errors": 0}
+
+    # Истинная асинхронность с семафором
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     start_time = time.time()
 
+    print(f"\nЗапуск {len(dialogs)} задач параллельно...")
+
     async with aiohttp.ClientSession() as session:
-        for i in range(0, len(dialogs), BATCH_SIZE):
-            batch = dialogs[i:i + BATCH_SIZE]
-            batch_num = i // BATCH_SIZE
-
-            print(f"\n[BATCH {batch_num}] Обработка {len(batch)} диалогов...")
-
-            tasks = [
-                verify_brands(session, d["dialog_id"], d["text"], d["candidates"], rate_limiter)
-                for d in batch
-            ]
-            batch_results = await asyncio.gather(*tasks)
-
-            for d, r in zip(batch, batch_results):
-                r["ground_truth"] = d["ground_truth"]
-                r["source_text"] = d["text"]
-                results.append(r)
-
-            success = sum(1 for r in batch_results if r["status"] == "success")
-            print(f"[BATCH {batch_num}] Успешно: {success}/{len(batch)}")
+        tasks = [
+            verify_brands(session, semaphore, dialog, progress)
+            for dialog in dialogs
+        ]
+        results = await asyncio.gather(*tasks)
 
     # Формирование результата
     output_rows = []
@@ -271,7 +268,8 @@ async def main():
     print("ГОТОВО")
     print(f"{'='*60}")
     print(f"Время: {(time.time() - start_time)/60:.1f} мин")
-    print(f"Обработано: {len(output_rows)}")
+    print(f"Успешно: {progress['success']}/{progress['total']}")
+    print(f"Ошибок: {progress['errors']}")
     print(f"Результат: {VERIFIED_FILE}")
 
 
