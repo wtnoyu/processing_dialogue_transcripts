@@ -19,9 +19,10 @@ VERIFIED_FILE = OUTPUT_DIR / "verified_brands.csv"
 
 # Настройки
 MAX_CONCURRENT = 8  # Максимум параллельных запросов
-MAX_RETRIES = 2
+MAX_RETRIES = 3
 RETRY_DELAY = 3
-TIMEOUT = 180  # секунд
+TIMEOUT = 180  # секунд (первая попытка)
+RETRY_TIMEOUT = 300  # секунд (при retry)
 
 # Промпт
 SYSTEM_PROMPT = """Ты эксперт аналитик. Твоя задача - определить, какие бренды/компании из предоставленного списка ДЕЙСТВИТЕЛЬНО упоминаются в диалоге КАК НАЗВАНИЯ БРЕНДОВ.
@@ -147,7 +148,9 @@ async def verify_brands(
                     "temperature": 0.1
                 }
 
-                timeout = aiohttp.ClientTimeout(total=TIMEOUT)
+                # Увеличенный timeout при retry
+                current_timeout = TIMEOUT if attempt == 0 else RETRY_TIMEOUT
+                timeout = aiohttp.ClientTimeout(total=current_timeout)
                 async with session.post(API_URL, headers=headers, json=payload, timeout=timeout) as response:
                     if response.status in [429, 503]:
                         if attempt < MAX_RETRIES:
@@ -230,7 +233,7 @@ async def main():
     dialogs_with_candidates = sum(1 for d in dialogs if d["candidates"])
     print(f"Диалогов с кандидатами: {dialogs_with_candidates}/{len(dialogs)}")
     print(f"Параллельных запросов: {MAX_CONCURRENT}")
-    print(f"Timeout: {TIMEOUT}s, Retries: {MAX_RETRIES}")
+    print(f"Timeout: {TIMEOUT}s (retry: {RETRY_TIMEOUT}s), Retries: {MAX_RETRIES}")
 
     # Прогресс
     progress = {"done": 0, "total": len(dialogs), "success": 0, "errors": 0}
