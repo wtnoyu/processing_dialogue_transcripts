@@ -73,6 +73,30 @@ class RateLimiter:
         self.last_call = time.time()
 
 
+def create_open_schema() -> dict:
+    """Создает схему без enum - для поиска любых брендов"""
+    return {
+        "type": "object",
+        "properties": {
+            "brands": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "quotes": {"type": "array", "items": {"type": "string"}},
+                        "confidence": {"type": "number"}
+                    },
+                    "required": ["name", "quotes", "confidence"],
+                    "additionalProperties": False
+                }
+            }
+        },
+        "required": ["brands"],
+        "additionalProperties": False
+    }
+
+
 async def verify_brands(
     session: aiohttp.ClientSession,
     dialog_id: int,
@@ -82,14 +106,6 @@ async def verify_brands(
     retry_count: int = 0
 ) -> dict:
     """Верифицирует бренды через LLM"""
-    # Если нет кандидатов - возвращаем пустой результат без вызова API
-    if not candidates:
-        return {
-            "dialog_id": dialog_id,
-            "verified_brands": [],
-            "status": "success"
-        }
-
     await rate_limiter.acquire()
 
     headers = {
@@ -97,19 +113,21 @@ async def verify_brands(
         "Content-Type": "application/json"
     }
 
-    # Формируем список брендов с синонимами
-    brands_formatted = []
-    brand_names = []
-    for item in candidates:
-        if '|' in item:
-            brand, synonym = item.split('|', 1)
-            brands_formatted.append(f"- {brand} (упоминается как '{synonym}')")
-            brand_names.append(brand)
-        else:
-            brands_formatted.append(f"- {item}")
-            brand_names.append(item)
+    # Формируем запрос в зависимости от наличия кандидатов
+    if candidates:
+        # Есть кандидаты - проверяем их
+        brands_formatted = []
+        brand_names = []
+        for item in candidates:
+            if '|' in item:
+                brand, synonym = item.split('|', 1)
+                brands_formatted.append(f"- {brand} (упоминается как '{synonym}')")
+                brand_names.append(brand)
+            else:
+                brands_formatted.append(f"- {item}")
+                brand_names.append(item)
 
-    user_message = f"""ДИАЛОГ:
+        user_message = f"""ДИАЛОГ:
 {dialog_text}
 
 СПИСОК БРЕНДОВ ДЛЯ ПРОВЕРКИ:
@@ -117,7 +135,15 @@ async def verify_brands(
 
 Укажи, какие бренды из списка ДЕЙСТВИТЕЛЬНО упоминаются в диалоге."""
 
-    schema = create_output_schema(brand_names)
+        schema = create_output_schema(brand_names)
+    else:
+        # Нет кандидатов - ищем любые бренды
+        user_message = f"""ДИАЛОГ:
+{dialog_text}
+
+Найди ВСЕ бренды товаров, производителей, маркетплейсов, которые упоминаются в диалоге."""
+
+        schema = create_open_schema()
 
     payload = {
         "model": MODEL,
