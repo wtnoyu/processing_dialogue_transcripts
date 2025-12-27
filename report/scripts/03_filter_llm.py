@@ -19,7 +19,7 @@ VERIFIED_FILE = OUTPUT_DIR / "verified_brands.csv"
 
 # Настройки
 MAX_CONCURRENT = 8  # Максимум параллельных запросов
-MAX_RETRIES = 3
+MAX_RETRIES = 2  # 3 попытки всего (1 + 2 retry)
 RETRY_DELAY = 3
 TIMEOUT = 180  # секунд (первая попытка)
 RETRY_TIMEOUT = 300  # секунд (при retry)
