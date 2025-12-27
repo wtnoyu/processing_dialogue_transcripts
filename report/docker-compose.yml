@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  brand-normalizer:
+    build: .
+    image: brand-normalizer:latest
+    container_name: brand-normalizer
+    environment:
+      - TOGETHER_API_KEY=${TOGETHER_API_KEY}
+    volumes:
+      # Входные данные
+      - ./data:/app/data:ro
+      # Выходные данные
+      - ./output:/app/output
+      # Синонимы (кэш)
+      - ./synonyms:/app/synonyms
+    command: []  # Полный пайплайн по умолчанию
+
+  # Только генерация синонимов
+  generate-synonyms:
+    build: .
+    environment:
+      - TOGETHER_API_KEY=${TOGETHER_API_KEY}
+    volumes:
+      - ./data:/app/data:ro
+      - ./synonyms:/app/synonyms
+    command: ["--step", "1"]
+
+  # Пайплайн без генерации синонимов (использует существующий файл)
+  run-pipeline:
+    build: .
+    environment:
+      - TOGETHER_API_KEY=${TOGETHER_API_KEY}
+    volumes:
+      - ./data:/app/data:ro
+      - ./output:/app/output
+      - ./synonyms:/app/synonyms
+    command: ["--skip-synonyms"]
