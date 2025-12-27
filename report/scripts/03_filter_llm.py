@@ -82,6 +82,14 @@ async def verify_brands(
     retry_count: int = 0
 ) -> dict:
     """Верифицирует бренды через LLM"""
+    # Если нет кандидатов - возвращаем пустой результат без вызова API
+    if not candidates:
+        return {
+            "dialog_id": dialog_id,
+            "verified_brands": [],
+            "status": "success"
+        }
+
     await rate_limiter.acquire()
 
     headers = {
@@ -172,20 +180,23 @@ async def main():
     df = pd.read_csv(MATCHED_FILE)
     print(f"Диалогов: {len(df)}")
 
-    # Подготовка
+    # Подготовка - обрабатываем ВСЕ диалоги
     dialogs = []
     for idx, row in df.iterrows():
         if pd.notna(row["matched_brands"]) and row["matched_brands"]:
             candidates = [b.strip() for b in row["matched_brands"].split("\n") if b.strip()]
-            if candidates:
-                dialogs.append({
-                    "dialog_id": row["dialog_id"],
-                    "text": row["source_text"],
-                    "candidates": candidates,
-                    "ground_truth": row["ground_truth"]
-                })
+        else:
+            candidates = []
 
-    print(f"Диалогов с кандидатами: {len(dialogs)}")
+        dialogs.append({
+            "dialog_id": row["dialog_id"],
+            "text": row["source_text"],
+            "candidates": candidates,
+            "ground_truth": row["ground_truth"]
+        })
+
+    dialogs_with_candidates = sum(1 for d in dialogs if d["candidates"])
+    print(f"Диалогов с кандидатами: {dialogs_with_candidates}/{len(dialogs)}")
     print(f"Примерное время: {len(dialogs) / MAX_RPS / 60:.1f} мин")
 
     # Обработка
